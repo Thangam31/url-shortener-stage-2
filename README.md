@@ -52,7 +52,7 @@ VPC: 10.0.0.0/16 (vpc-067648cd5c3f3f2ad)
 
 │ │ │
 
-│ └── NAT Instance (i-081db7405c4d181f6) │
+│ └──  NAT Instance (i-03b6fe7206654cf21) │
 
 └─────────────────────────────────────────────────┘
 
@@ -140,9 +140,7 @@ VPC: 10.0.0.0/16 (vpc-067648cd5c3f3f2ad)
 
 | Internet Gateway | igw-069688acb21529b3a | $0 |
 
-| NAT Instance | i-081db7405c4d181f6 | \~$0.012/hr |
-
-| public-rt | rtb-0bc0446b8431ed92f | $0 |
+|NAT Instance | i-03b6fe7206654cf21 | \~$0.012/hr|
 
 | app-rt | rtb-0c85652f0fdde8d22 | $0 |
 
