@@ -1,216 +1,120 @@
-\# Stage 2 — Phase 1: VPC Foundation
+﻿# URL Shortener: Stage 2 (3-Tier AWS Architecture)
 
+Stage 2 of my DevOps portfolio. One URL shortener app, rebuilt in increasingly production-grade stages.
 
+| Stage | What | Repo |
+|---|---|---|
+| 0 | Portfolio site (S3 + CloudFront + GitHub Actions) | portfolio-site |
+| 1 | Single EC2, Docker, systemd, shell script | url-shortener-stage-1 |
+| **2** | **3-tier: ALB + Auto Scaling + private subnets + NAT instance** | **this repo** |
+| 3 | Everything in Terraform | url-shortener-terraform |
 
-\## What I Built
+## Architecture
 
+~~~
+Internet
+   |
+   v
+ALB (public subnets, ap-south-1a / 1b)
+   |  port 80 -> target group (port 8080, health check /health)
+   v
+Auto Scaling Group (private app subnets, no public IP)
+   |  Docker container: gunicorn + Flask
+   v
+NAT instance (public subnet) --> Internet (image pull, updates)
+~~~
 
+### Network layout
 
-A production-grade 3-tier VPC on AWS in the `ap-south-1` (Mumbai) region.
+| Layer | Subnets | Public IP |
+|---|---|---|
+| Public | public-1a, public-1b (ALB, NAT instance) | Yes |
+| App | app-1a, app-1b (ASG instances) | No |
+| Data | data-1a, data-1b (reserved for DB, Stage 5) | No |
 
+### Security groups
 
+| SG | Inbound |
+|---|---|
+| alb-sg | 80 from 0.0.0.0/0 |
+| app-sg | 8080 from alb-sg only, 22 from VPC CIDR |
+| nat-sg | Traffic from private subnets, admin SSH |
 
-\## Architecture
+### Design decisions
 
-VPC: 10.0.0.0/16 (vpc-067648cd5c3f3f2ad)
+- **App tier in private subnets.** Only the ALB is internet-facing, which reduces the attack surface.
+- **App SG allows port 8080 only from the ALB SG**, not from CIDR ranges.
+- **NAT Instance instead of NAT Gateway.** A NAT Gateway costs about $32/month and has no free tier. A t3.micro NAT instance fits the free tier.
+- **ELB health checks on the ASG** (not just EC2 status), so an unhealthy app gets replaced.
+- **Two AZs** for the ALB and the ASG.
 
+## Proof it works
 
+Instances: the app server has no public IP, the NAT instance does.
 
-┌─────────────────────────────────────────────────┐
+![instances](docs/instances.png)
 
-│ Public Subnets (internet via IGW) │
+Health check through the ALB:
 
-│ ┌──────────────┐ ┌──────────────┐ │
+![health](docs/health.png)
 
-│ │ public-1a │ │ public-1b │ │
+Shorten and redirect:
 
-│ │ 10.0.1.0/24 │ │ 10.0.2.0/24 │ │
+![shorten](docs/shorten.png)
+~~~
+POST /shorten  ->  {"code":"qVkAIV","short":"http://<alb-dns>/qVkAIV"}
+GET  /qVkAIV   ->  302 FOUND, Location: https://github.com/Thangam31
+~~~
 
-│ │ (AZ-a) │ │ (AZ-b) │ │
+## Troubleshooting
 
-│ └──────────────┘ └──────────────┘ │
+### Incident 1: ASG kept launching instances, none healthy
 
-│ │ │
+**Symptom:** ASG had Desired = 1, but more instances kept appearing and the target never became healthy.
 
-│ │ Internet Gateway (igw-3tier) │
+**Investigation:**
+1. Instance had no public IP. This was expected, since it is in a private subnet.
+2. NAT instance checks: IP forwarding on, source/dest check disabled, both fine.
+3. `sudo iptables -t nat -L -n -v` showed an **empty POSTROUTING chain**.
 
-└─────────┼───────────────────────────────────────┘
+**Root cause:** No iptables MASQUERADE rule on the NAT instance. Private instances could not reach the internet, so user-data (`dnf install docker`, `docker pull`) hung. Health checks failed, and the ASG kept replacing instances.
 
-│
+**Fix:**
+1. Found the real interface name: `ip -o route get 1.1.1.1` gave `ens5` (not `eth0`)
+2. `sudo iptables -t nat -A POSTROUTING -o ens5 -j MASQUERADE`
+3. Persisted it: `iptables-services` + `iptables-save > /etc/sysconfig/iptables`
+4. Verified both private subnets route `0.0.0.0/0` to the NAT instance
+5. Terminated extra NAT instances, reset the ASG, target went healthy
 
-┌─────────┼───────────────────────────────────────┐
+**Lesson:** A NAT instance needs three things: IP forwarding, source/dest check off, and a MASQUERADE rule. Missing any one breaks all private-subnet egress.
 
-│ App Subnets (internet OUTBOUND ONLY via NAT) │
+### Incident 2: ALB, target group and ASG were gone
 
-│ ┌──────────────┐ ┌──────────────┐ │
+After cleanup, `describe-auto-scaling-groups` returned null and `describe-load-balancers` returned nothing. ASG creation failed with "Provided Target Groups may not be valid".
 
-│ │ app-1a │ │ app-1b │ │
+**Fix:** Rebuilt target group, ALB, listener and ASG from the CLI.
 
-│ │ 10.0.3.0/24 │ │ 10.0.4.0/24 │ │
+**Lesson:** Manual CLI and console work is fragile and hard to reproduce. This is why Stage 3 moves everything to Terraform.
 
-│ └──────────────┘ └──────────────┘ │
+## Known limitations and next steps
 
-│ │ │
+- Links are stored **in memory**, so they are lost when the container or instance is replaced. Next: DynamoDB or RDS data tier.
+- Single NAT instance is a single point of failure (cost tradeoff).
+- No SSM Session Manager (no IAM instance profile on the launch template).
+- HTTP only. Next: HTTPS via ACM.
 
-│ └──  NAT Instance (i-03b6fe7206654cf21) │
+## Cost control
 
-└─────────────────────────────────────────────────┘
+Free-tier friendly. At the end of each session:
 
-│
+```bash
+aws autoscaling update-auto-scaling-group --auto-scaling-group-name url-shortener-asg --min-size 0 --desired-capacity 0
+aws ec2 stop-instances --instance-ids <nat-instance-id>
+```
 
-┌─────────┼───────────────────────────────────────┐
+The ALB bills hourly, so I delete it when I am not working on the project.
 
-│ Data Subnets (fully isolated — NO internet) │
+## Stack
 
-│ ┌──────────────┐ ┌──────────────┐ │
-
-│ │ data-1a │ │ data-1b │ │
-
-│ │ 10.0.5.0/24 │ │ 10.0.6.0/24 │ │
-
-│ └──────────────┘ └──────────────┘ │
-
-└─────────────────────────────────────────────────┘
-
-
-
-\## Route Tables
-
-
-
-| Route Table | Attached To | Internet Route | Purpose |
-
-|:---|:---|:---|:---|
-
-| `public-rt` | public-1a, public-1b | `0.0.0.0/0` → IGW | Load balancer + NAT |
-
-| `app-rt` | app-1a, app-1b | `0.0.0.0/0` → NAT instance | App servers (outbound only) |
-
-| `data-rt` | data-1a, data-1b | ❌ none | Database (isolated) |
-
-
-
-\## Key Design Decisions
-
-
-
-\### Why NAT Instance instead of NAT Gateway?
-
-\- \*\*NAT Gateway\*\*: \~$32/month, fully managed
-
-\- \*\*NAT Instance\*\* (t3.micro): \~$4/month, self-managed
-
-\- \*\*Trade-off\*\*: Save 90% cost; acceptable for learning and small-scale projects
-
-\- \*\*Interview answer\*\*: \*"I chose a NAT instance because the NAT Gateway is idle expensive at \~$32/month. A t3.micro with iptables MASQUERADE gives the same functionality at a fraction of the cost. For production with heavy traffic or compliance needs, I'd use a managed NAT Gateway."\*
-
-
-
-\### Why 3 separate route tables?
-
-\- \*\*Isolation\*\*: Each tier has different internet access needs
-
-\- \*\*Security\*\*: Data tier has NO internet route → DB can never be accessed from outside
-
-\- \*\*Blast radius\*\*: Compromise in one tier can't pivot through another's network
-
-
-
-\### Why 2 AZs for each tier?
-
-\- \*\*High Availability\*\*: If AZ-a fails, AZ-b keeps serving
-
-\- \*\*No single point of failure\*\*: ALB distributes traffic across both
-
-\- \*\*Future-proofing\*\*: Ready for RDS Multi-AZ when budget allows
-
-
-
-\## Components Created
-
-
-
-| Resource | ID | Cost |
-
-|:---|:---|:---|
-
-| VPC | vpc-067648cd5c3f3f2ad | $0 |
-
-| 6 subnets | — | $0 |
-
-| Internet Gateway | igw-069688acb21529b3a | $0 |
-
-|NAT Instance | i-03b6fe7206654cf21 | \~$0.012/hr|
-
-| app-rt | rtb-0c85652f0fdde8d22 | $0 |
-
-| data-rt | rtb-0b0279a9984460303 | $0 |
-
-| NAT Security Group | sg-0b0ed61072782ef54 | $0 |
-
-
-
-\## Troubleshooting
-
-
-
-\### Issue: NAT instance launched without SSH key
-
-\*\*Cause:\*\* Forgot `--key-name` in `run-instances` command.
-
-\*\*Fix:\*\* Terminated and relaunched with `--key-name url-shortener-key`.
-
-\*\*Lesson:\*\* Always include all required parameters. AWS CLI won't always warn if a parameter is missing — it just creates a broken resource.
-
-
-
-\### Issue: iptables MASQUERADE rule missing
-
-\*\*Cause:\*\* User-data script ran `iptables` before installing `iptables-services`.
-
-\*\*Fix:\*\* Installed package first, then added rule manually, then saved.
-
-\*\*Lesson:\*\* Order matters in user-data. Install dependencies before using their commands. Test user-data on a fresh instance.
-
-
-
-\### Issue: SSH "Permission denied" on Windows
-
-\*\*Cause:\*\* Windows file permissions on `.pem` were too open.
-
-\*\*Fix:\*\* `icacls` to strip inherited permissions, granted only current user read access.
-
-\*\*Lesson:\*\* On Windows, always `icacls file.pem /inheritance:r` before SSH.
-
-
-
-\## Cost Optimization
-
-
-
-| Item | Cost |
-
-|:---|:---:|
-
-| NAT instance while running | \~$0.017/hr |
-
-| VPC, subnets, IGW, routes | \*\*$0\*\* |
-
-| \*\*Overnight (NAT stopped)\*\* | \*\*\~$0.02/day\*\* |
-
-
-
-\*\*Habit:\*\* Stop NAT instance at the end of every work session. Restart next session — route tables keep pointing to the instance ID, so no reconfiguration needed.
-
-
-
-\## What's Next
-
-
-
-\- \*\*Phase 2\*\*: Application Load Balancer + Auto Scaling Group
-
-\- \*\*Phase 3\*\*: RDS + Secrets Manager
-
-\- \*\*Phase 4\*\*: Codify everything in Terraform
+AWS (VPC, EC2, ALB, Auto Scaling, Launch Templates), Linux (iptables), Docker, Python (Flask, gunicorn), AWS CLI
 
